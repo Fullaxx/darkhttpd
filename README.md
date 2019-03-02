@@ -1,7 +1,7 @@
 # darkhttpd running in docker
 
 ## Credit
-I did not write darkhttpd. Credit goes to Emil Mikulic <emikulic@gmail.com> [Darkhttpd Home Page](https://unix4lyfe.org/darkhttpd/) \
+I did not write [darkhttpd](https://unix4lyfe.org/darkhttpd/). Credit goes to Emil Mikulic <emikulic@gmail.com> \
 Also thanks to [Daniel Lundin](https://github.com/dln/darkhttpd) for the brilliant Dockerfile
 
 ## Base Docker Image
