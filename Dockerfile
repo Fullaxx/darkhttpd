@@ -6,4 +6,4 @@ RUN gcc -static -s -o darkhttpd darkhttpd.c
 
 FROM scratch
 COPY --from=build /src/darkhttpd /darkhttpd
-ENTRYPOINT ["/darkhttpd]
+ENTRYPOINT ["/darkhttpd"]

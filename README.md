@@ -12,7 +12,8 @@ SCRATCH
     docker pull fullaxx/darkhttpd
 
 ## Run the image
-TODO
+
+    docker run -t -p 80:80 -v /srv/docker/darkhttpd/www:/www fullaxx/darkhttpd /www
 
 ## Build it locally using the github repository
 
