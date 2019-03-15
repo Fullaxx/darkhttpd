@@ -1,4 +1,4 @@
-# A docker container running darkhttpd
+# A tiny docker image running darkhttpd
 
 ## Credit
 I did not write [darkhttpd](https://unix4lyfe.org/darkhttpd/). Credit goes to Emil Mikulic <emikulic@gmail.com> \
