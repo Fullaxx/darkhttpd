@@ -13,7 +13,7 @@ docker pull fullaxx/darkhttpd
 ```
 ## Run the image
 ```
-docker run -t -p 80:80 -v /srv/docker/darkhttpd/www:/www fullaxx/darkhttpd /www
+docker run -d -p 80:80 -v /srv/docker/darkhttpd/www:/www fullaxx/darkhttpd /www
 ```
 ## Build it locally using the github repository
 ```
