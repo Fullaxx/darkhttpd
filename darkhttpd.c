@@ -1,6 +1,6 @@
 /* darkhttpd - a simple, single-threaded, static content webserver.
  * https://unix4lyfe.org/darkhttpd/
- * Copyright (c) 2003-2016 Emil Mikulic <emikulic@gmail.com>
+ * Copyright (c) 2003-2024 Emil Mikulic <emikulic@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the
@@ -18,8 +18,8 @@
  */
 
 static const char
-    pkgname[]   = "darkhttpd/1.12",
-    copyright[] = "copyright (c) 2003-2016 Emil Mikulic";
+    pkgname[]   = "darkhttpd/1.16.from.git",
+    copyright[] = "copyright (c) 2003-2024 Emil Mikulic";
 
 /* Possible build options: -DDEBUG -DNO_IPV6 */
 
@@ -44,6 +44,7 @@ static const int debug = 1;
 # include <sys/sendfile.h>
 #endif
 
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -66,8 +67,40 @@ static const int debug = 1;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+
+/* The time formatting that we use in directory listings.                    */
+/* An example of the default is 2013-09-09 13:01, which should be compatible */
+/* with xbmc/kodi.                                                           */
+#define DIR_LIST_MTIME_FORMAT "%Y-%m-%d %R"
+#define DIR_LIST_MTIME_SIZE 16 + 1 /* How large the buffer will need to be. */
+
+/* This is for non-root chroot support on FreeBSD 14.0+ */
+/* Must set sysctl security.bsd.unprivileged_chroot=1 to allow this. */
+#ifdef __FreeBSD__
+# if __FreeBSD_version >= 1400000
+#  define HAVE_NON_ROOT_CHROOT
+# endif
+#endif
+
+/* https://github.com/hboetes/mg/issues/7#issuecomment-475869095 */
+#if defined(__APPLE__) || defined(__NetBSD__)
+#define st_atim st_atimespec
+#define st_ctim st_ctimespec
+#define st_mtim st_mtimespec
+#endif
+
+#ifdef HAVE_NON_ROOT_CHROOT
+#include <sys/procctl.h>
+#endif
+
+#if defined(__has_feature)
+# if __has_feature(memory_sanitizer)
+#  include <sanitizer/msan_interface.h>
+# endif
+#endif
 
 #ifdef __sun__
 # ifndef INADDR_NONE
@@ -228,7 +261,7 @@ struct connection {
     size_t request_length;
 
     /* request fields */
-    char *method, *url, *referer, *user_agent;
+    char *method, *url, *referer, *user_agent, *authorization;
     off_t range_begin, range_end;
     off_t range_begin_given, range_end_given;
 
@@ -252,6 +285,8 @@ static struct forward_mapping *forward_map = NULL;
 static size_t forward_map_size = 0;
 static const char *forward_all_url = NULL;
 
+static int forward_to_https = 0;
+
 struct mime_mapping {
     char *extension, *mimetype;
 };
@@ -260,11 +295,10 @@ static struct mime_mapping *mime_map = NULL;
 static size_t mime_map_size = 0;
 static size_t longest_ext = 0;
 
-/* If a connection is idle for idletime seconds or more, it gets closed and
- * removed from the connlist.  Set to 0 to remove the timeout
- * functionality.
+/* If a connection is idle for timeout_secs or more, it gets closed and
+ * removed from the connlist.
  */
-static int idletime = 60;
+static int timeout_secs = 30;
 static char *keep_alive_field = NULL;
 
 /* Time is cached in the event loop to avoid making an excessive number of
@@ -279,8 +313,8 @@ static time_t now;
 
 /* Defaults can be overridden on the command-line */
 static const char *bindaddr;
-static uint16_t bindport = 8080; /* or 80 if running as root */
-static int max_connections = -1;        /* kern.ipc.somaxconn */
+static uint16_t bindport = 8080;    /* or 80 if running as root */
+static int max_connections = -1;    /* kern.ipc.somaxconn */
 static const char *index_name = "index.html";
 static int no_listing = 0;
 
@@ -293,11 +327,14 @@ static char *logfile_name = NULL;   /* NULL = no logging */
 static FILE *logfile = NULL;
 static char *pidfile_name = NULL;   /* NULL = no pidfile */
 static int want_chroot = 0, want_daemon = 0, want_accf = 0,
-           want_keepalive = 1, want_server_id = 1;
+           want_keepalive = 1, want_server_id = 1, want_single_file = 0;
 static char *server_hdr = NULL;
+static char *auth_key = NULL;       /* NULL or "Basic base64_of_password" */
+static char *custom_hdrs = NULL;
 static uint64_t num_requests = 0, total_in = 0, total_out = 0;
-
-static volatile int running = 1; /* signal handler sets this to false */
+static int accepting = 1;           /* set to 0 to stop accept()ing */
+static int syslog_enabled = 0;
+volatile int running = 0; /* signal handler sets this to false */
 
 #define INVALID_UID ((uid_t) -1)
 #define INVALID_GID ((gid_t) -1)
@@ -307,23 +344,36 @@ static gid_t drop_gid = INVALID_GID;
 
 /* Default mimetype mappings - make sure this array is NULL terminated. */
 static const char *default_extension_map[] = {
-    "application/ogg"      " ogg",
+    "application/json"     " json",
     "application/pdf"      " pdf",
+    "application/wasm"     " wasm",
     "application/xml"      " xsl xml",
     "application/xml-dtd"  " dtd",
     "application/xslt+xml" " xslt",
     "application/zip"      " zip",
+    "audio/flac"           " flac",
     "audio/mpeg"           " mp2 mp3 mpga",
+    "audio/ogg"            " ogg opus oga spx",
+    "audio/wav"            " wav",
+    "audio/x-m4a"          " m4a",
+    "font/woff"            " woff",
+    "font/woff2"           " woff2",
+    "image/apng"           " apng",
+    "image/avif"           " avif",
     "image/gif"            " gif",
     "image/jpeg"           " jpeg jpe jpg",
     "image/png"            " png",
+    "image/svg+xml"        " svg",
+    "image/webp"           " webp",
     "text/css"             " css",
     "text/html"            " html htm",
     "text/javascript"      " js",
     "text/plain"           " txt asc",
     "video/mpeg"           " mpeg mpe mpg",
     "video/quicktime"      " qt mov",
+    "video/webm"           " webm",
     "video/x-msvideo"      " avi",
+    "video/mp4"            " mp4 m4v",
     NULL
 };
 
@@ -366,16 +416,6 @@ static char *xstrdup(const char *src) {
     memcpy(dest, src, len);
     return dest;
 }
-
-#ifdef __sun /* unimpressed by Solaris */
-static int vasprintf(char **strp, const char *fmt, va_list ap) {
-    char tmp;
-    int result = vsnprintf(&tmp, 1, fmt, ap);
-    *strp = xmalloc(result+1);
-    result = vsnprintf(*strp, result+1, fmt, ap);
-    return result;
-}
-#endif
 
 /* vasprintf() that dies if it fails. */
 static unsigned int xvasprintf(char **ret, const char *format, va_list ap)
@@ -481,118 +521,62 @@ static char *split_string(const char *src,
     return dest;
 }
 
-/* Consolidate slashes in-place by shifting parts of the string over repeated
- * slashes.
- */
-static void consolidate_slashes(char *s) {
-    size_t left = 0, right = 0;
-    int saw_slash = 0;
-
-    assert(s != NULL);
-    while (s[right] != '\0') {
-        if (saw_slash) {
-            if (s[right] == '/')
-                right++;
-            else {
-                saw_slash = 0;
-                s[left++] = s[right++];
-            }
-        } else {
-            if (s[right] == '/')
-                saw_slash++;
-            s[left++] = s[right++];
-        }
-    }
-    s[left] = '\0';
-}
-
-/* Resolve /./ and /../ in a URL, in-place.  Also strip out query params.
+/* Resolve /./ and /../ in a URL, in-place.
  * Returns NULL if the URL is invalid/unsafe, or the original buffer if
  * successful.
  */
-static char *make_safe_url(char *url) {
-    struct {
-        char *start;
-        size_t len;
-    } *chunks;
-    unsigned int num_slashes, num_chunks;
-    size_t urllen, i, j, pos;
-    int ends_in_slash;
+static char *make_safe_url(char *const url) {
+    char *src = url, *dst;
+    #define ends(c) ((c) == '/' || (c) == '\0')
 
-    /* strip query params */
-    for (pos=0; url[pos] != '\0'; pos++) {
-        if (url[pos] == '?') {
-            url[pos] = '\0';
-            break;
-        }
-    }
-
-    if (url[0] != '/')
+    /* URLs not starting with a slash are illegal. */
+    if (*src != '/')
         return NULL;
 
-    consolidate_slashes(url);
-    urllen = strlen(url);
-    if (urllen > 0)
-        ends_in_slash = (url[urllen-1] == '/');
-    else
-        ends_in_slash = 1;
-
-    /* count the slashes */
-    for (i=0, num_slashes=0; i < urllen; i++)
-        if (url[i] == '/')
-            num_slashes++;
-
-    /* make an array for the URL elements */
-    assert(num_slashes > 0);
-    chunks = xmalloc(sizeof(*chunks) * num_slashes);
-
-    /* split by slashes and build chunks array */
-    num_chunks = 0;
-    for (i=1; i<urllen;) {
-        /* look for the next slash */
-        for (j=i; j<urllen && url[j] != '/'; j++)
-            ;
-
-        /* process url[i,j) */
-        if ((j == i+1) && (url[i] == '.'))
-            /* "." */;
-        else if ((j == i+2) && (url[i] == '.') && (url[i+1] == '.')) {
-            /* ".." */
-            if (num_chunks == 0) {
-                /* unsafe string so free chunks */
-                free(chunks);
-                return (NULL);
-            } else
-                num_chunks--;
-        } else {
-            chunks[num_chunks].start = url+i;
-            chunks[num_chunks].len = j-i;
-            num_chunks++;
+    /* Fast case: skip until first double-slash or dot-dir. */
+    for ( ; *src; ++src) {
+        if (*src == '/') {
+            if (src[1] == '/')
+                break;
+            else if (src[1] == '.') {
+                if (ends(src[2]))
+                    break;
+                else if (src[2] == '.' && ends(src[3]))
+                    break;
+            }
         }
-
-        i = j + 1; /* url[j] is a slash - move along one */
     }
 
-    /* reassemble in-place */
-    pos = 0;
-    for (i=0; i<num_chunks; i++) {
-        assert(pos <= urllen);
-        url[pos++] = '/';
-
-        assert(pos + chunks[i].len <= urllen);
-        assert(url + pos <= chunks[i].start);
-
-        if (url+pos < chunks[i].start)
-            memmove(url+pos, chunks[i].start, chunks[i].len);
-        pos += chunks[i].len;
+    /* Copy to dst, while collapsing multi-slashes and handling dot-dirs. */
+    dst = src;
+    while (*src) {
+        if (*src != '/')
+            *dst++ = *src++;
+        else if (*++src == '/')
+            ;
+        else if (*src != '.')
+            *dst++ = '/';
+        else if (ends(src[1]))
+            /* Ignore single-dot component. */
+            ++src;
+        else if (src[1] == '.' && ends(src[2])) {
+            /* Double-dot component. */
+            src += 2;
+            if (dst == url)
+                return NULL; /* Illegal URL */
+            else
+                /* Backtrack to previous slash. */
+                while (*--dst != '/' && dst > url);
+        }
+        else
+            *dst++ = '/';
     }
-    free(chunks);
 
-    if ((num_chunks == 0) || ends_in_slash)
-        url[pos++] = '/';
-    assert(pos <= urllen);
-    url[pos] = '\0';
+    if (dst == url)
+        ++dst;
+    *dst = '\0';
     return url;
+    #undef ends
 }
 
 static void add_forward_mapping(const char * const host,
@@ -813,8 +797,12 @@ static const char *get_address_text(const void *addr) {
 #ifdef HAVE_INET6
     if (inet6) {
         static char text_addr[INET6_ADDRSTRLEN];
-        inet_ntop(AF_INET6, (const struct in6_addr *)addr, text_addr,
-                  INET6_ADDRSTRLEN);
+        const struct in6_addr *in6_addr = addr;
+        inet_ntop(AF_INET6, in6_addr, text_addr, INET6_ADDRSTRLEN);
+        /* IPv4 addresses via dual stack result in mapped IPv6 addresses.
+           Strip the prefix (::ffff:) for plain IPv4 addresses. */
+        if (IN6_IS_ADDR_V4MAPPED(in6_addr))
+            return text_addr + 7;
         return text_addr;
     } else
 #endif
@@ -823,7 +811,7 @@ static const char *get_address_text(const void *addr) {
     }
 }
 
-/* Initialize the sockin global.  This is the socket that we accept
+/* Initialize the sockin global. This is the socket that we accept
  * connections from.
  */
 static void init_sockin(void) {
@@ -838,7 +826,7 @@ static void init_sockin(void) {
     if (inet6) {
         memset(&addrin6, 0, sizeof(addrin6));
         if (inet_pton(AF_INET6, bindaddr ? bindaddr : "::",
-                      &addrin6.sin6_addr) == -1) {
+                      &addrin6.sin6_addr) != 1) {
             errx(1, "malformed --addr argument");
         }
         sockin = socket(PF_INET6, SOCK_STREAM, 0);
@@ -861,12 +849,22 @@ static void init_sockin(void) {
                    &sockopt, sizeof(sockopt)) == -1)
         err(1, "setsockopt(SO_REUSEADDR)");
 
-#if 0
     /* disable Nagle since we buffer everything ourselves */
     sockopt = 1;
     if (setsockopt(sockin, IPPROTO_TCP, TCP_NODELAY,
             &sockopt, sizeof(sockopt)) == -1)
         err(1, "setsockopt(TCP_NODELAY)");
+
+#ifdef HAVE_INET6
+    if (inet6) {
+        /* Listen on IPv4 and IPv6 on the same socket.               */
+        /* Only relevant if listening on ::, but behaves normally if */
+        /* listening on a specific address.                          */
+        sockopt = 0;
+        if (setsockopt(sockin, IPPROTO_IPV6, IPV6_V6ONLY,
+                &sockopt, sizeof (sockopt)) < 0)
+            err(1, "setsockopt (IPV6_V6ONLY)");
+    }
 #endif
 
 #ifdef TORTURE
@@ -892,7 +890,7 @@ static void init_sockin(void) {
         if (getsockname(sockin, (struct sockaddr *)&addrin6, &addrin_len) == -1)
             err(1, "getsockname()");
         printf("listening on: http://[%s]:%u/\n",
-            get_address_text(&addrin6.sin6_addr), bindport);
+            get_address_text(&addrin6.sin6_addr), ntohs(addrin6.sin6_port));
     } else
 #endif
     {
@@ -905,7 +903,7 @@ static void init_sockin(void) {
         if (getsockname(sockin, (struct sockaddr *)&addrin, &addrin_len) == -1)
             err(1, "getsockname()");
         printf("listening on: http://%s:%u/\n",
-            get_address_text(&addrin.sin_addr), bindport);
+            get_address_text(&addrin.sin_addr), ntohs(addrin.sin_port));
     }
 
     /* listen on socket */
@@ -936,14 +934,22 @@ static void usage(const char *argv0) {
     printf("\t--addr ip (default: all)\n"
     "\t\tIf multiple interfaces are present, specifies\n"
     "\t\twhich one to bind the listening port to.\n\n");
+#ifdef HAVE_INET6
+    printf("\t--ipv6\n"
+    "\t\tListen on IPv6 address.\n\n");
+#endif
+    printf("\t--daemon (default: don't daemonize)\n"
+    "\t\tDetach from the controlling terminal and run in the background.\n\n");
+    printf("\t--pidfile filename (default: no pidfile)\n"
+    "\t\tWrite PID to the specified file. Note that if you are\n"
+    "\t\tusing --chroot, then the pidfile must be relative to,\n"
+    "\t\tand inside the wwwroot.\n\n");
     printf("\t--maxconn number (default: system maximum)\n"
     "\t\tSpecifies how many concurrent connections to accept.\n\n");
     printf("\t--log filename (default: stdout)\n"
     "\t\tSpecifies which file to append the request log to.\n\n");
-    printf("\t--chroot (default: don't chroot)\n"
-    "\t\tLocks server into wwwroot directory for added security.\n\n");
-    printf("\t--daemon (default: don't daemonize)\n"
-    "\t\tDetach from the controlling terminal and run in the background.\n\n");
+    printf("\t--syslog\n"
+    "\t\tUse syslog for request log.\n\n");
     printf("\t--index filename (default: %s)\n"
     "\t\tDefault file to serve when a directory is requested.\n\n",
         index_name);
@@ -956,16 +962,17 @@ static void usage(const char *argv0) {
         octet_stream);
     printf("\t--uid uid/uname, --gid gid/gname (default: don't privdrop)\n"
     "\t\tDrops privileges to given uid:gid after initialization.\n\n");
-    printf("\t--pidfile filename (default: no pidfile)\n"
-    "\t\tWrite PID to the specified file.  Note that if you are\n"
-    "\t\tusing --chroot, then the pidfile must be relative to,\n"
-    "\t\tand inside the wwwroot.\n\n");
-    printf("\t--no-keepalive\n"
-    "\t\tDisables HTTP Keep-Alive functionality.\n\n");
+    printf("\t--chroot (default: don't chroot)\n"
+    "\t\tLocks server into wwwroot directory for added security.\n\n");
 #ifdef __FreeBSD__
     printf("\t--accf (default: don't use acceptfilter)\n"
-    "\t\tUse acceptfilter.  Needs the accf_http module loaded.\n\n");
+    "\t\tUse acceptfilter. Needs the accf_http kernel module loaded.\n\n");
 #endif
+    printf("\t--no-keepalive\n"
+    "\t\tDisables HTTP Keep-Alive functionality.\n\n");
+    printf("\t--single-file\n"
+    "\t\tOnly serve a single file provided as /path/to/file instead\n"
+    "\t\tof a whole directory.\n\n");
     printf("\t--forward host url (default: don't forward)\n"
     "\t\tWeb forward (301 redirect).\n"
     "\t\tRequests to the host are redirected to the corresponding url.\n"
@@ -974,15 +981,68 @@ static void usage(const char *argv0) {
     printf("\t--forward-all url (default: don't forward)\n"
     "\t\tWeb forward (301 redirect).\n"
     "\t\tAll requests are redirected to the corresponding url.\n\n");
+    printf("\t--forward-https\n"
+    "\t\tIf the client requested HTTP, forward to HTTPS.\n"
+    "\t\tThis is useful if darkhttpd is behind a reverse proxy\n"
+    "\t\tthat supports SSL.\n\n");
     printf("\t--no-server-id\n"
     "\t\tDon't identify the server type in headers\n"
     "\t\tor directory listings.\n\n");
-#ifdef HAVE_INET6
-    printf("\t--ipv6\n"
-    "\t\tListen on IPv6 address.\n\n");
-#else
+    printf("\t--timeout secs (default: %d)\n"
+    "\t\tIf a connection is idle for more than this many seconds,\n"
+    "\t\tit will be closed. Set to zero to disable timeouts.\n\n",
+    timeout_secs);
+    printf("\t--auth username:password\n"
+    "\t\tEnable basic authentication. This is *INSECURE*: passwords\n"
+    "\t\tare sent unencrypted over HTTP, plus the password is visible\n"
+    "\t\tin ps(1) to other users on the system.\n\n");
+    printf("\t--header 'Header: Value'\n"
+    "\t\tAdd a custom header to all responses.\n"
+    "\t\tThis option can be specified multiple times, in which case\n"
+    "\t\tthe headers are added in order of appearance.\n\n");
+#ifndef HAVE_INET6
     printf("\t(This binary was built without IPv6 support: -DNO_IPV6)\n\n");
 #endif
+}
+
+static char *base64_encode(char *str) {
+    const char base64_table[] = {
+        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
+        'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+        'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
+        'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
+        'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
+        'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+        'w', 'x', 'y', 'z', '0', '1', '2', '3',
+        '4', '5', '6', '7', '8', '9', '+', '/'};
+
+    int input_length = strlen(str);
+    int output_length = 4 * ((input_length + 2) / 3);
+
+    char *encoded_data = malloc(output_length+1);
+    if (encoded_data == NULL) return NULL;
+
+    int i;
+    int j;
+    for (i = 0, j = 0; i < input_length;) {
+        uint32_t octet_a = i < input_length ? (unsigned char)str[i++] : 0;
+        uint32_t octet_b = i < input_length ? (unsigned char)str[i++] : 0;
+        uint32_t octet_c = i < input_length ? (unsigned char)str[i++] : 0;
+
+        uint32_t triple = (octet_a << 0x10) + (octet_b << 0x08) + octet_c;
+
+        encoded_data[j++] = base64_table[(triple >> 3 * 6) & 0x3F];
+        encoded_data[j++] = base64_table[(triple >> 2 * 6) & 0x3F];
+        encoded_data[j++] = base64_table[(triple >> 1 * 6) & 0x3F];
+        encoded_data[j++] = base64_table[(triple >> 0 * 6) & 0x3F];
+    }
+
+    const int mod_table[] = {0, 2, 1};
+    for (i = 0; i < mod_table[input_length % 3]; i++)
+        encoded_data[output_length - 1 - i] = '=';
+    encoded_data[output_length] = '\0';
+
+    return encoded_data;
 }
 
 /* Returns 1 if string is a number, 0 otherwise.  Set num to NULL if
@@ -1027,10 +1087,14 @@ static void parse_commandline(const int argc, char *argv[]) {
     if (getuid() == 0)
         bindport = 80;
 
+    custom_hdrs = strdup("");
+
     wwwroot = xstrdup(argv[1]);
     /* Strip ending slash. */
     len = strlen(wwwroot);
-    if (len > 0)
+    if (len == 0)
+        errx(1, "/path/to/wwwroot cannot be empty");
+    if (len > 1)
         if (wwwroot[len - 1] == '/')
             wwwroot[len - 1] = '\0';
 
@@ -1116,6 +1180,12 @@ static void parse_commandline(const int argc, char *argv[]) {
         else if (strcmp(argv[i], "--accf") == 0) {
             want_accf = 1;
         }
+        else if (strcmp(argv[i], "--syslog") == 0) {
+            syslog_enabled = 1;
+        }
+        else if (strcmp(argv[i], "--single-file") == 0) {
+            want_single_file = 1;
+        }
         else if (strcmp(argv[i], "--forward") == 0) {
             const char *host, *url;
             if (++i >= argc)
@@ -1133,6 +1203,31 @@ static void parse_commandline(const int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--no-server-id") == 0) {
             want_server_id = 0;
+        }
+        else if (strcmp(argv[i], "--timeout") == 0) {
+            if (++i >= argc)
+                errx(1, "missing number after --timeout");
+            timeout_secs = (int)xstr_to_num(argv[i]);
+        }
+        else if (strcmp(argv[i], "--auth") == 0) {
+            if (++i >= argc || strchr(argv[i], ':') == NULL)
+                errx(1, "missing 'user:pass' after --auth");
+
+            char *key = base64_encode(argv[i]);
+            xasprintf(&auth_key, "Basic %s", key);
+            free(key);
+        }
+        else if (strcmp(argv[i], "--forward-https") == 0) {
+            forward_to_https = 1;
+        }
+        else if (strcmp(argv[i], "--header") == 0) {
+            if (++i >= argc)
+                errx(1, "missing argument after --header");
+            if (strchr(argv[i], '\n') != NULL || strstr(argv[i], ": ") == NULL)
+                errx(1, "malformed argument after --header");
+            char *old_custom_hdrs = custom_hdrs;
+            xasprintf(&custom_hdrs, "%s%s\r\n", old_custom_hdrs, argv[i]);
+            free(old_custom_hdrs);
         }
 #ifdef HAVE_INET6
         else if (strcmp(argv[i], "--ipv6") == 0) {
@@ -1157,6 +1252,7 @@ static struct connection *new_connection(void) {
     conn->url = NULL;
     conn->referer = NULL;
     conn->user_agent = NULL;
+    conn->authorization = NULL;
     conn->range_begin = 0;
     conn->range_end = 0;
     conn->range_begin_given = 0;
@@ -1192,28 +1288,32 @@ static void accept_connection(void) {
 #endif
     socklen_t sin_size;
     struct connection *conn;
-
-    /* allocate and initialise struct connection */
-    conn = new_connection();
+    int fd;
 
 #ifdef HAVE_INET6
     if (inet6) {
         sin_size = sizeof(addrin6);
         memset(&addrin6, 0, sin_size);
-        conn->socket = accept(sockin, (struct sockaddr *)&addrin6, &sin_size);
+        fd = accept(sockin, (struct sockaddr *)&addrin6, &sin_size);
     } else
 #endif
     {
         sin_size = sizeof(addrin);
         memset(&addrin, 0, sin_size);
-        conn->socket = accept(sockin, (struct sockaddr *)&addrin, &sin_size);
+        fd = accept(sockin, (struct sockaddr *)&addrin, &sin_size);
     }
 
-    if (conn->socket == -1)
-        err(1, "accept()");
+    if (fd == -1) {
+        /* Failed to accept, but try to keep serving existing connections. */
+        if (errno == EMFILE || errno == ENFILE) accepting = 0;
+        warn("accept()");
+        return;
+    }
 
+    /* Allocate and initialize struct connection. */
+    conn = new_connection();
+    conn->socket = fd;
     nonblock_socket(conn->socket);
-
     conn->state = RECV_REQUEST;
 
 #ifdef HAVE_INET6
@@ -1227,8 +1327,10 @@ static void accept_connection(void) {
     LIST_INSERT_HEAD(&connlist, conn, entries);
 
     if (debug)
-        printf("accepted connection from %s:%u\n",
-               inet_ntoa(addrin.sin_addr), ntohs(addrin.sin_port));
+        printf("accepted connection from %s:%u (fd %d)\n",
+               inet_ntoa(addrin.sin_addr),
+               ntohs(addrin.sin_port),
+               conn->socket);
 
     /* Try to read straight away rather than going through another iteration
      * of the select() loop.
@@ -1260,9 +1362,24 @@ static void logencode(const char *src, char *dest) {
     dest[j] = '\0';
 }
 
+/* Format [when] as a CLF date format, stored in the specified buffer.  The same
+ * buffer is returned for convenience.
+ */
+#define CLF_DATE_LEN 29 /* strlen("[10/Oct/2000:13:55:36 -0700]")+1 */
+static char *clf_date(char *dest, const time_t when) {
+    time_t when_copy = when;
+    struct tm tm;
+    localtime_r(&when_copy, &tm);
+    if (strftime(dest, CLF_DATE_LEN, "[%d/%b/%Y:%H:%M:%S %z]", &tm) == 0) {
+        dest[0] = 0;
+    }
+    return dest;
+}
+
 /* Add a connection's details to the logfile. */
 static void log_connection(const struct connection *conn) {
-    char *safe_method, *safe_url, *safe_referer, *safe_user_agent;
+    char *safe_method, *safe_url, *safe_referer, *safe_user_agent,
+    dest[CLF_DATE_LEN];
 
     if (logfile == NULL)
         return;
@@ -1271,13 +1388,14 @@ static void log_connection(const struct connection *conn) {
     if (conn->method == NULL)
         return; /* invalid - didn't parse - maybe too long */
 
-#define make_safe(x) \
+#define make_safe(x) do { \
     if (conn->x) { \
         safe_##x = xmalloc(strlen(conn->x)*3 + 1); \
         logencode(conn->x, safe_##x); \
     } else { \
         safe_##x = NULL; \
-    }
+    } \
+} while(0)
 
     make_safe(method);
     make_safe(url);
@@ -1285,10 +1403,21 @@ static void log_connection(const struct connection *conn) {
     make_safe(user_agent);
 
 #define use_safe(x) safe_##x ? safe_##x : ""
-
-    fprintf(logfile, "%lu %s \"%s %s\" %d %llu \"%s\" \"%s\"\n",
-        (unsigned long int)now,
+  if (syslog_enabled) {
+    syslog(LOG_INFO, "%s - - %s \"%s %s HTTP/1.1\" %d %llu \"%s\" \"%s\"\n",
         get_address_text(&conn->client),
+        clf_date(dest, now),
+        use_safe(method),
+        use_safe(url),
+        conn->http_code,
+        llu(conn->total_sent),
+        use_safe(referer),
+        use_safe(user_agent)
+        );
+  } else {
+    fprintf(logfile, "%s - - %s \"%s %s HTTP/1.1\" %d %llu \"%s\" \"%s\"\n",
+        get_address_text(&conn->client),
+        clf_date(dest, now),
         use_safe(method),
         use_safe(url),
         conn->http_code,
@@ -1297,8 +1426,8 @@ static void log_connection(const struct connection *conn) {
         use_safe(user_agent)
         );
     fflush(logfile);
-
-#define free_safe(x) if (safe_##x) free(safe_##x);
+  }
+#define free_safe(x) if (safe_##x) free(safe_##x)
 
     free_safe(method);
     free_safe(url);
@@ -1320,9 +1449,12 @@ static void free_connection(struct connection *conn) {
     if (conn->url != NULL) free(conn->url);
     if (conn->referer != NULL) free(conn->referer);
     if (conn->user_agent != NULL) free(conn->user_agent);
+    if (conn->authorization != NULL) free(conn->authorization);
     if (conn->header != NULL && !conn->header_dont_free) free(conn->header);
     if (conn->reply != NULL && !conn->reply_dont_free) free(conn->reply);
     if (conn->reply_fd != -1) xclose(conn->reply_fd);
+    /* If we ran out of sockets, try to resume accepting. */
+    accepting = 1;
 }
 
 /* Recycle a finished connection for HTTP/1.1 Keep-Alive. */
@@ -1341,6 +1473,7 @@ static void recycle_connection(struct connection *conn) {
     conn->url = NULL;
     conn->referer = NULL;
     conn->user_agent = NULL;
+    conn->authorization = NULL;
     conn->range_begin = 0;
     conn->range_end = 0;
     conn->range_begin_given = 0;
@@ -1371,14 +1504,14 @@ static void strntoupper(char *str, const size_t length) {
         str[i] = (char)toupper(str[i]);
 }
 
-/* If a connection has been idle for more than idletime seconds, it will be
- * marked as DONE and killed off in httpd_poll()
+/* If a connection has been idle for more than timeout_secs, it will be
+ * marked as DONE and killed off in httpd_poll().
  */
 static void poll_check_timeout(struct connection *conn) {
-    if (idletime > 0) { /* optimised away by compiler */
-        if (now - conn->last_active >= idletime) {
+    if (timeout_secs > 0) {
+        if (now - conn->last_active >= timeout_secs) {
             if (debug)
-                printf("poll_check_timeout(%d) caused closure\n",
+                printf("poll_check_timeout(%d) closing connection\n",
                        conn->socket);
             conn->conn_close = 1;
             conn->state = DONE;
@@ -1393,8 +1526,9 @@ static void poll_check_timeout(struct connection *conn) {
 static char *rfc1123_date(char *dest, const time_t when) {
     time_t when_copy = when;
     if (strftime(dest, DATE_LEN,
-                 "%a, %d %b %Y %H:%M:%S GMT", gmtime(&when_copy)) == 0)
-        errx(1, "strftime() failed [%s]", dest);
+                 "%a, %d %b %Y %H:%M:%S GMT", gmtime(&when_copy)) == 0) {
+        dest[0] = 0;
+    }
     return dest;
 }
 
@@ -1463,7 +1597,7 @@ static void default_reply(struct connection *conn,
     rfc1123_date(date, now);
 
     conn->reply_length = xasprintf(&(conn->reply),
-     "<html><head><title>%d %s</title></head><body>\n"
+     "<!DOCTYPE html><html><head><title>%d %s</title></head><body>\n"
      "<h1>%s</h1>\n" /* errname */
      "%s\n" /* reason */
      "<hr>\n"
@@ -1472,20 +1606,29 @@ static void default_reply(struct connection *conn,
      errcode, errname, errname, reason, generated_on(date));
     free(reason);
 
+    const char auth_header[] =
+        "WWW-Authenticate: Basic realm=\"User Visible Realm\"\r\n";
+
     conn->header_length = xasprintf(&(conn->header),
      "HTTP/1.1 %d %s\r\n"
      "Date: %s\r\n"
      "%s" /* server */
      "Accept-Ranges: bytes\r\n"
      "%s" /* keep-alive */
+     "%s" /* custom headers */
      "Content-Length: %llu\r\n"
      "Content-Type: text/html; charset=UTF-8\r\n"
+     "%s"
      "\r\n",
      errcode, errname, date, server_hdr, keep_alive(conn),
-     llu(conn->reply_length));
+     custom_hdrs, llu(conn->reply_length),
+     (auth_key != NULL ? auth_header : ""));
 
     conn->reply_type = REPLY_GENERATED;
     conn->http_code = errcode;
+
+    /* Reset reply_start in case the request set a range. */
+    conn->reply_start = 0;
 }
 
 static void redirect(struct connection *conn, const char *format, ...)
@@ -1502,7 +1645,7 @@ static void redirect(struct connection *conn, const char *format, ...) {
     rfc1123_date(date, now);
 
     conn->reply_length = xasprintf(&(conn->reply),
-     "<html><head><title>301 Moved Permanently</title></head><body>\n"
+     "<!DOCTYPE html><html><head><title>301 Moved Permanently</title></head><body>\n"
      "<h1>Moved Permanently</h1>\n"
      "Moved to: <a href=\"%s\">%s</a>\n" /* where x 2 */
      "<hr>\n"
@@ -1517,10 +1660,12 @@ static void redirect(struct connection *conn, const char *format, ...) {
      /* "Accept-Ranges: bytes\r\n" - not relevant here */
      "Location: %s\r\n"
      "%s" /* keep-alive */
+     "%s" /* custom headers */
      "Content-Length: %llu\r\n"
      "Content-Type: text/html; charset=UTF-8\r\n"
      "\r\n",
-     date, server_hdr, where, keep_alive(conn), llu(conn->reply_length));
+     date, server_hdr, where, keep_alive(conn),
+     custom_hdrs, llu(conn->reply_length));
 
     free(where);
     conn->reply_type = REPLY_GENERATED;
@@ -1529,7 +1674,7 @@ static void redirect(struct connection *conn, const char *format, ...) {
 
 /* Parses a single HTTP request field.  Returns string from end of [field] to
  * first \r, \n or end of request string.  Returns NULL if [field] can't be
- * matched.
+ * matched.  Case insensitive.
  *
  * You need to remember to deallocate the result.
  * example: parse_field(conn, "Referer: ");
@@ -1539,7 +1684,7 @@ static char *parse_field(const struct connection *conn, const char *field) {
     char *pos;
 
     /* find start */
-    pos = strstr(conn->request, field);
+    pos = strcasestr(conn->request, field);
     if (pos == NULL)
         return NULL;
     assert(pos >= conn->request);
@@ -1555,6 +1700,49 @@ static char *parse_field(const struct connection *conn, const char *field) {
 
     /* copy to buffer */
     return split_string(conn->request, bound1, bound2);
+}
+
+static void redirect_https(struct connection *conn) {
+    char *host, *url;
+
+    /* work out path of file being requested */
+    url = urldecode(conn->url);
+
+    /* make sure it's safe */
+    if (make_safe_url(url) == NULL) {
+        default_reply(conn, 400, "Bad Request",
+                      "You requested an invalid URL.");
+        free(url);
+        return;
+    }
+
+    host = parse_field(conn, "Host: ");
+    if (host == NULL) {
+        default_reply(conn, 400, "Bad Request",
+                "Missing 'Host' header.");
+        free(url);
+        return;
+    }
+
+    redirect(conn, "https://%s%s", host, url);
+    free(host);
+    free(url);
+}
+
+static int is_https_redirect(struct connection *conn) {
+    char *proto = NULL;
+
+    if (forward_to_https == 0)
+        return 0; /* --forward-https was never used */
+
+    proto = parse_field(conn, "X-Forwarded-Proto: ");
+    if (proto == NULL || strcasecmp(proto, "https") == 0) {
+        free(proto);
+        return 0;
+    }
+
+    free(proto);
+    return 1;
 }
 
 /* Parse a Range: field into range_begin and range_end.  Only handles the
@@ -1575,7 +1763,7 @@ static void parse_range_field(struct connection *conn) {
         /* parse number up to hyphen */
         bound1 = 0;
         for (bound2=0;
-            isdigit((int)range[bound2]) && (bound2 < len);
+            (bound2 < len) && isdigit((int)range[bound2]);
             bound2++)
                 ;
 
@@ -1590,7 +1778,7 @@ static void parse_range_field(struct connection *conn) {
         /* parse number after hyphen */
         bound2++;
         for (bound1=bound2;
-            isdigit((int)range[bound2]) && (bound2 < len);
+            (bound2 < len) && isdigit((int)range[bound2]);
             bound2++)
                 ;
 
@@ -1683,6 +1871,7 @@ static int parse_request(struct connection *conn) {
     /* parse important fields */
     conn->referer = parse_field(conn, "Referer: ");
     conn->user_agent = parse_field(conn, "User-Agent: ");
+    conn->authorization = parse_field(conn, "Authorization: ");
     parse_range_field(conn);
     return 1;
 }
@@ -1696,9 +1885,10 @@ static int file_exists(const char *path) {
 }
 
 struct dlent {
-    char *name;
-    int is_dir;
-    off_t size;
+    char *name;            /* The name/path of the entry.                 */
+    int is_dir;            /* If the entry is a directory and not a file. */
+    off_t size;            /* The size of the entry, in bytes.            */
+    struct timespec mtime; /* When the file was last modified.            */
 };
 
 static int dlent_cmp(const void *a, const void *b) {
@@ -1728,8 +1918,8 @@ static ssize_t make_sorted_dirlist(const char *path, struct dlent ***output) {
     while ((ent = readdir(dir)) != NULL) {
         struct stat s;
 
-        if ((ent->d_name[0] == '.') && (ent->d_name[1] == '\0'))
-            continue; /* skip "." */
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue; /* skip "." and ".." */
         assert(strlen(ent->d_name) <= MAXNAMLEN);
         sprintf(currname, "%s%s", path, ent->d_name);
         if (stat(currname, &s) == -1)
@@ -1742,6 +1932,7 @@ static ssize_t make_sorted_dirlist(const char *path, struct dlent ***output) {
         list[entries]->name = xstrdup(ent->d_name);
         list[entries]->is_dir = S_ISDIR(s.st_mode);
         list[entries]->size = s.st_size;
+        list[entries]->mtime = s.st_mtim;
         entries++;
     }
     closedir(dir);
@@ -1797,36 +1988,81 @@ static void urlencode(const char *src, char *dest) {
     dest[j] = '\0';
 }
 
-static void generate_dir_listing(struct connection *conn, const char *path) {
+/* Escape < > & ' " into HTML entities. */
+static void append_escaped(struct apbuf *dst, const char *src) {
+    int pos = 0;
+    while (src[pos] != '\0') {
+        switch (src[pos]) {
+            case '<':
+                append(dst, "&lt;");
+                break;
+            case '>':
+                append(dst, "&gt;");
+                break;
+            case '&':
+                append(dst, "&amp;");
+                break;
+            case '\'':
+                append(dst, "&apos;");
+                break;
+            case '"':
+                append(dst, "&quot;");
+                break;
+            default:
+                appendl(dst, src+pos, 1);
+        }
+        pos++;
+    }
+}
+
+static void generate_dir_listing(struct connection *conn, const char *path,
+        const char *decoded_url) {
     char date[DATE_LEN], *spaces;
     struct dlent **list;
     ssize_t listsize;
-    size_t maxlen = 2; /* There has to be ".." */
+    size_t maxlen = 3; /* There has to be ".." */
     int i;
     struct apbuf *listing;
 
     listsize = make_sorted_dirlist(path, &list);
     if (listsize == -1) {
-        default_reply(conn, 500, "Internal Server Error",
-                      "Couldn't list directory: %s", strerror(errno));
+        /* opendir() failed */
+        if (errno == EACCES)
+            default_reply(conn, 403, "Forbidden",
+                "You don't have permission to access this URL.");
+        else if (errno == ENOENT)
+            default_reply(conn, 404, "Not Found",
+                "The URL you requested was not found.");
+        else
+            default_reply(conn, 500, "Internal Server Error",
+                "Couldn't list directory: %s", strerror(errno));
         return;
     }
 
     for (i=0; i<listsize; i++) {
         size_t tmp = strlen(list[i]->name);
+        if (list[i]->is_dir)
+            tmp++; /* add 1 for '/' */
         if (maxlen < tmp)
             maxlen = tmp;
     }
 
     listing = make_apbuf();
-    append(listing, "<html>\n<head>\n <title>");
-    append(listing, conn->url);
-    append(listing, "</title>\n</head>\n<body>\n<h1>");
-    append(listing, conn->url);
-    append(listing, "</h1>\n<tt><pre>\n");
+    append(listing, "<!DOCTYPE html>\n<html>\n<head>\n<title>");
+    append_escaped(listing, decoded_url);
+    append(listing,
+            "</title>\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "</head>\n<body>\n<h1>");
+    append_escaped(listing, decoded_url);
+    append(listing, "</h1>\n<pre>\n");
 
     spaces = xmalloc(maxlen);
     memset(spaces, ' ', maxlen);
+
+    /* append ".." entry if not in wwwroot */
+    if (strncmp(path, wwwroot, strlen(path) - 1) != 0)
+        append(listing, "<a href=\"../\">..</a>/\n");
 
     for (i=0; i<listsize; i++) {
         /* If a filename is made up of entirely unsafe chars,
@@ -1838,15 +2074,28 @@ static void generate_dir_listing(struct connection *conn, const char *path) {
 
         append(listing, "<a href=\"");
         append(listing, safe_url);
+        if (list[i]->is_dir)
+            append(listing, "/");
         append(listing, "\">");
-        append(listing, list[i]->name);
+        append_escaped(listing, list[i]->name);
         append(listing, "</a>");
 
-        if (list[i]->is_dir)
-            append(listing, "/\n");
+        char buf[DIR_LIST_MTIME_SIZE];
+        struct tm tm;
+        localtime_r(&list[i]->mtime.tv_sec, &tm);
+        strftime(buf, sizeof buf, DIR_LIST_MTIME_FORMAT, &tm);
+
+        if (list[i]->is_dir) {
+            append(listing, "/");
+            appendl(listing, spaces, maxlen-strlen(list[i]->name));
+            append(listing, buf);
+            append(listing, "\n");
+        }
         else {
             appendl(listing, spaces, maxlen-strlen(list[i]->name));
-            appendf(listing, "%10llu\n", llu(list[i]->size));
+            append(listing, " ");
+            append(listing, buf);
+            appendf(listing, " %10llu\n", llu(list[i]->size));
         }
     }
 
@@ -1854,9 +2103,7 @@ static void generate_dir_listing(struct connection *conn, const char *path) {
     free(list);
     free(spaces);
 
-    append(listing,
-     "</pre></tt>\n"
-     "<hr>\n");
+    append(listing, "</pre>\n<hr>\n");
 
     rfc1123_date(date, now);
     append(listing, generated_on(date));
@@ -1872,10 +2119,12 @@ static void generate_dir_listing(struct connection *conn, const char *path) {
      "%s" /* server */
      "Accept-Ranges: bytes\r\n"
      "%s" /* keep-alive */
+     "%s" /* custom headers */
      "Content-Length: %llu\r\n"
      "Content-Type: text/html; charset=UTF-8\r\n"
      "\r\n",
-     date, server_hdr, keep_alive(conn), llu(conn->reply_length));
+     date, server_hdr, keep_alive(conn), custom_hdrs,
+     llu(conn->reply_length));
 
     conn->reply_type = REPLY_GENERATED;
     conn->http_code = 200;
@@ -1883,11 +2132,15 @@ static void generate_dir_listing(struct connection *conn, const char *path) {
 
 /* Process a GET/HEAD request. */
 static void process_get(struct connection *conn) {
-    char *decoded_url, *target, *if_mod_since;
+    char *decoded_url, *end, *target, *if_mod_since;
     char date[DATE_LEN], lastmod[DATE_LEN];
     const char *mimetype = NULL;
     const char *forward_to = NULL;
     struct stat filestat;
+
+    /* strip out query params */
+    if ((end = strchr(conn->url, '?')) != NULL)
+        *end = '\0';
 
     /* work out path of file being requested */
     decoded_url = urldecode(conn->url);
@@ -1895,7 +2148,7 @@ static void process_get(struct connection *conn) {
     /* make sure it's safe */
     if (make_safe_url(decoded_url) == NULL) {
         default_reply(conn, 400, "Bad Request",
-                      "You requested an invalid URL: %s", conn->url);
+                      "You requested an invalid URL.");
         free(decoded_url);
         return;
     }
@@ -1925,8 +2178,12 @@ static void process_get(struct connection *conn) {
         return;
     }
 
-    /* does it end in a slash? serve up url/index_name */
-    if (decoded_url[strlen(decoded_url)-1] == '/') {
+    if (want_single_file) {
+        target = xstrdup(wwwroot);
+        mimetype = url_content_type(wwwroot);
+    }
+    else if (decoded_url[strlen(decoded_url)-1] == '/') {
+        /* does it end in a slash? serve up url/index_name */
         xasprintf(&target, "%s%s%s", wwwroot, decoded_url, index_name);
         if (!file_exists(target)) {
             free(target);
@@ -1937,11 +2194,11 @@ static void process_get(struct connection *conn) {
                  * i.e.: Don't leak information.
                  */
                 default_reply(conn, 404, "Not Found",
-                    "The URL you requested (%s) was not found.", conn->url);
+                    "The URL you requested was not found.");
                 return;
             }
             xasprintf(&target, "%s%s", wwwroot, decoded_url);
-            generate_dir_listing(conn, target);
+            generate_dir_listing(conn, target, decoded_url);
             free(target);
             free(decoded_url);
             return;
@@ -1966,14 +2223,14 @@ static void process_get(struct connection *conn) {
         /* open() failed */
         if (errno == EACCES)
             default_reply(conn, 403, "Forbidden",
-                "You don't have permission to access (%s).", conn->url);
+                "You don't have permission to access this URL.");
         else if (errno == ENOENT)
             default_reply(conn, 404, "Not Found",
-                "The URL you requested (%s) was not found.", conn->url);
+                "The URL you requested was not found.");
         else
             default_reply(conn, 500, "Internal Server Error",
-                "The URL you requested (%s) cannot be returned: %s.",
-                conn->url, strerror(errno));
+                "The URL you requested cannot be returned: %s.",
+                strerror(errno));
 
         return;
     }
@@ -1986,7 +2243,7 @@ static void process_get(struct connection *conn) {
     }
 
     /* make sure it's a regular file */
-    if (S_ISDIR(filestat.st_mode)) {
+    if ((S_ISDIR(filestat.st_mode)) && (!want_single_file)) {
         redirect(conn, "%s/", conn->url);
         return;
     }
@@ -2011,8 +2268,10 @@ static void process_get(struct connection *conn) {
          "%s" /* server */
          "Accept-Ranges: bytes\r\n"
          "%s" /* keep-alive */
+         "%s" /* custom headers */
          "\r\n",
-         rfc1123_date(date, now), server_hdr, keep_alive(conn));
+         rfc1123_date(date, now), server_hdr, keep_alive(conn),
+         custom_hdrs);
         conn->reply_length = 0;
         conn->reply_type = REPLY_GENERATED;
         conn->header_only = 1;
@@ -2072,6 +2331,7 @@ static void process_get(struct connection *conn) {
             "%s" /* server */
             "Accept-Ranges: bytes\r\n"
             "%s" /* keep-alive */
+            "%s" /* custom headers */
             "Content-Length: %llu\r\n"
             "Content-Range: bytes %llu-%llu/%llu\r\n"
             "Content-Type: %s\r\n"
@@ -2079,6 +2339,7 @@ static void process_get(struct connection *conn) {
             "\r\n"
             ,
             rfc1123_date(date, now), server_hdr, keep_alive(conn),
+            custom_hdrs,
             llu(conn->reply_length), llu(from), llu(to),
             llu(filestat.st_size), mimetype, lastmod
         );
@@ -2096,24 +2357,63 @@ static void process_get(struct connection *conn) {
             "%s" /* server */
             "Accept-Ranges: bytes\r\n"
             "%s" /* keep-alive */
+            "%s" /* custom headers */
             "Content-Length: %llu\r\n"
             "Content-Type: %s\r\n"
             "Last-Modified: %s\r\n"
             "\r\n"
             ,
             rfc1123_date(date, now), server_hdr, keep_alive(conn),
-            llu(conn->reply_length), mimetype, lastmod
+            custom_hdrs, llu(conn->reply_length), mimetype, lastmod
         );
         conn->http_code = 200;
     }
 }
 
+/* Returns 1 if passwords are equal, runtime is proportional to the length of
+ * user_input to avoid leaking the secret's length and contents through timing
+ * information.
+ */
+int password_equal(const char *user_input, const char *secret) {
+    size_t i = 0;
+    size_t j = 0;
+    char out = 0;
+
+    while (1) {
+        /* Out stays zero if the strings are the same. */
+        out |= user_input[i] ^ secret[j];
+
+        /* Stop at end of user_input. */
+        if (user_input[i] == 0) break;
+        i++;
+
+        /* Don't go past end of secret. */
+        if (secret[j] != 0) j++;
+    }
+
+    /* Check length after loop, otherwise early exit would leak length. */
+    out |= (i != j); /* Secret was shorter. */
+    out |= (secret[j] != 0); /* Secret was longer; j is not the end. */
+    return out == 0;
+}
+
 /* Process a request: build the header and reply, advance state. */
 static void process_request(struct connection *conn) {
     num_requests++;
+
     if (!parse_request(conn)) {
         default_reply(conn, 400, "Bad Request",
             "You sent a request that the server couldn't understand.");
+    }
+    else if (is_https_redirect(conn)) {
+        redirect_https(conn);
+    }
+    /* fail if: (auth_enabled) AND (client supplied invalid credentials) */
+    else if (auth_key != NULL &&
+            (conn->authorization == NULL ||
+             !password_equal(conn->authorization, auth_key))) {
+        default_reply(conn, 401, "Unauthorized",
+            "Access denied due to invalid credentials.");
     }
     else if (strcmp(conn->method, "GET") == 0) {
         process_get(conn);
@@ -2122,19 +2422,9 @@ static void process_request(struct connection *conn) {
         process_get(conn);
         conn->header_only = 1;
     }
-    else if ((strcmp(conn->method, "OPTIONS") == 0) ||
-             (strcmp(conn->method, "POST") == 0) ||
-             (strcmp(conn->method, "PUT") == 0) ||
-             (strcmp(conn->method, "DELETE") == 0) ||
-             (strcmp(conn->method, "TRACE") == 0) ||
-             (strcmp(conn->method, "CONNECT") == 0)) {
-        default_reply(conn, 501, "Not Implemented",
-                      "The method you specified (%s) is not implemented.",
-                      conn->method);
-    }
     else {
-        default_reply(conn, 400, "Bad Request",
-                      "%s is not a valid HTTP/1.1 method.", conn->method);
+        default_reply(conn, 501, "Not Implemented",
+                      "The method you specified is not implemented.");
     }
 
     /* advance state */
@@ -2252,6 +2542,8 @@ static void poll_send_header(struct connection *conn) {
  * <size>.  Use sendfile() if possible since it's zero-copy on some platforms.
  * Returns the number of bytes sent, 0 on closure, -1 if send() failed, -2 if
  * read error.
+ *
+ * TODO: send headers with sendfile(), this will result in fewer packets.
  */
 static ssize_t send_from_file(const int s, const int fd,
         off_t ofs, size_t size) {
@@ -2313,6 +2605,10 @@ static ssize_t send_from_file(const int s, const int fd,
 static void poll_send_reply(struct connection *conn)
 {
     ssize_t sent;
+    /* off_t can be wider than size_t, avoid overflow in send_len */
+    const size_t max_size_t = ~((size_t)0);
+    off_t send_len = conn->reply_length - conn->reply_sent;
+    if (send_len > max_size_t) send_len = max_size_t;
 
     assert(conn->state == SEND_REPLY);
     assert(!conn->header_only);
@@ -2320,14 +2616,13 @@ static void poll_send_reply(struct connection *conn)
         assert(conn->reply_length >= conn->reply_sent);
         sent = send(conn->socket,
             conn->reply + conn->reply_start + conn->reply_sent,
-            (size_t)(conn->reply_length - conn->reply_sent), 0);
+            (size_t)send_len, 0);
     }
     else {
         errno = 0;
         assert(conn->reply_length >= conn->reply_sent);
         sent = send_from_file(conn->socket, conn->reply_fd,
-            conn->reply_start + conn->reply_sent,
-            (size_t)(conn->reply_length - conn->reply_sent));
+            conn->reply_start + conn->reply_sent, (size_t)send_len);
         if (debug && (sent < 1))
             printf("send_from_file returned %lld (errno=%d %s)\n",
                 (long long)sent, errno, strerror(errno));
@@ -2375,9 +2670,9 @@ static void httpd_poll(void) {
     int max_fd, select_ret;
     struct connection *conn, *next;
     int bother_with_timeout = 0;
-    struct timeval timeout;
+    struct timeval timeout, t0, t1;
 
-    timeout.tv_sec = idletime;
+    timeout.tv_sec = timeout_secs;
     timeout.tv_usec = 0;
 
     FD_ZERO(&recv_set);
@@ -2385,15 +2680,15 @@ static void httpd_poll(void) {
     max_fd = 0;
 
     /* set recv/send fd_sets */
-#define MAX_FD_SET(sock, fdset) { FD_SET(sock,fdset); \
-                                max_fd = (max_fd<sock) ? sock : max_fd; }
-    MAX_FD_SET(sockin, &recv_set);
+#define MAX_FD_SET(sock, fdset) do { FD_SET(sock,fdset); \
+                                max_fd = (max_fd<sock) ? sock : max_fd; } \
+                                while (0)
+    if (accepting) MAX_FD_SET(sockin, &recv_set);
 
     LIST_FOREACH_SAFE(conn, &connlist, entries, next) {
-        poll_check_timeout(conn);
         switch (conn->state) {
         case DONE:
-            /* do nothing */
+            /* do nothing, no connection should be left in this state */
             break;
 
         case RECV_REQUEST:
@@ -2410,20 +2705,45 @@ static void httpd_poll(void) {
     }
 #undef MAX_FD_SET
 
+#if defined(__has_feature)
+# if __has_feature(memory_sanitizer)
+    __msan_unpoison(&recv_set, sizeof(recv_set));
+    __msan_unpoison(&send_set, sizeof(send_set));
+# endif
+#endif
+
     /* -select- */
+    if (timeout_secs == 0) {
+        bother_with_timeout = 0;
+    }
+    if (debug) {
+        printf("select() with max_fd %d timeout %d\n",
+                max_fd, bother_with_timeout ? (int)timeout.tv_sec : 0);
+        gettimeofday(&t0, NULL);
+    }
     select_ret = select(max_fd + 1, &recv_set, &send_set, NULL,
         (bother_with_timeout) ? &timeout : NULL);
     if (select_ret == 0) {
         if (!bother_with_timeout)
             errx(1, "select() timed out");
-        else
-            return;
     }
     if (select_ret == -1) {
         if (errno == EINTR)
             return; /* interrupted by signal */
         else
             err(1, "select() failed");
+    }
+    if (debug) {
+        long long sec, usec;
+        gettimeofday(&t1, NULL);
+        sec = t1.tv_sec - t0.tv_sec;
+        usec = t1.tv_usec - t0.tv_usec;
+        if (usec < 0) {
+            usec += 1000000;
+            sec--;
+        }
+        printf("select() returned %d after %lld.%06lld secs\n",
+                select_ret, sec, usec);
     }
 
     /* update time */
@@ -2434,6 +2754,7 @@ static void httpd_poll(void) {
         accept_connection();
 
     LIST_FOREACH_SAFE(conn, &connlist, entries, next) {
+        poll_check_timeout(conn);
         switch (conn->state) {
         case RECV_REQUEST:
             if (FD_ISSET(conn->socket, &recv_set)) poll_recv_request(conn);
@@ -2452,6 +2773,7 @@ static void httpd_poll(void) {
             break;
         }
 
+        /* Handling SEND_REPLY could have set the state to done. */
         if (conn->state == DONE) {
             /* clean out finished connection */
             if (conn->conn_close) {
@@ -2460,10 +2782,6 @@ static void httpd_poll(void) {
                 free(conn);
             } else {
                 recycle_connection(conn);
-                /* and go right back to recv_request without going through
-                 * select() again.
-                 */
-                poll_recv_request(conn);
             }
         }
     }
@@ -2600,6 +2918,48 @@ static void pidfile_create(void) {
 }
 /* [<-] end of pidfile helpers. */
 
+static void change_root(void) {
+    #ifdef HAVE_NON_ROOT_CHROOT
+    /* We run this even as root, which should never be a bad thing. */
+    int arg = PROC_NO_NEW_PRIVS_ENABLE;
+    int error = procctl(P_PID, (int)getpid(), PROC_NO_NEW_PRIVS_CTL, &arg);
+    if (error != 0)
+        err(1, "procctl");
+    #endif
+
+    tzset(); /* read /etc/localtime before we chroot */
+    if (want_single_file) {
+        off_t ofs;
+        size_t len = strlen(wwwroot) + 1;
+        char *path = xstrdup(wwwroot);
+        for (ofs = strlen(wwwroot);
+             (ofs >= 0) && (wwwroot[ofs] != '/');
+             ofs--)
+            ;
+        /* wwwroot file is not in current directory */
+        if (ofs >= 0) {
+            path[ofs + 1] = '\0';
+            if (chdir(path) == -1)
+                err(1, "chdir(%s)", path);
+            memmove(wwwroot, &wwwroot[ofs], len - ofs);
+        } else {
+            path[0] = '.';
+            path[1] = '\0';
+        }
+        if (chroot(path) == -1)
+            err(1, "chroot(%s)", path);
+        printf("chrooted to `%s'\n", path);
+        free(path);
+    } else {
+        if (chdir(wwwroot) == -1)
+            err(1, "chdir(%s)", wwwroot);
+        if (chroot(wwwroot) == -1)
+            err(1, "chroot(%s)", wwwroot);
+        printf("chrooted to `%s'\n", wwwroot);
+        wwwroot[0] = '\0'; /* empty string */
+    }
+}
+
 /* Close all sockets and FILEs and exit. */
 static void stop_running(int sig unused) {
     running = 0;
@@ -2614,7 +2974,7 @@ int main(int argc, char **argv) {
      * parsing a user-specified file.
      */
     sort_mime_map();
-    xasprintf(&keep_alive_field, "Keep-Alive: timeout=%d\r\n", idletime);
+    xasprintf(&keep_alive_field, "Keep-Alive: timeout=%d\r\n", timeout_secs);
     if (want_server_id)
         xasprintf(&server_hdr, "Server: %s\r\n", pkgname);
     else
@@ -2643,13 +3003,7 @@ int main(int argc, char **argv) {
 
     /* security */
     if (want_chroot) {
-        tzset(); /* read /etc/localtime before we chroot */
-        if (chdir(wwwroot) == -1)
-            err(1, "chdir(%s)", wwwroot);
-        if (chroot(wwwroot) == -1)
-            err(1, "chroot(%s)", wwwroot);
-        printf("chrooted to `%s'\n", wwwroot);
-        wwwroot[0] = '\0'; /* empty string */
+        change_root();
     }
     if (drop_gid != INVALID_GID) {
         gid_t list[1];
@@ -2672,6 +3026,7 @@ int main(int argc, char **argv) {
     if (want_daemon) daemonize_finish();
 
     /* main loop */
+    running = 1;
     while (running) httpd_poll();
 
     /* clean exit */
@@ -2703,6 +3058,8 @@ int main(int argc, char **argv) {
         free(keep_alive_field);
         free(wwwroot);
         free(server_hdr);
+        free(auth_key);
+        free(custom_hdrs);
     }
 
     /* usage stats */
@@ -2723,4 +3080,4 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-/* vim:set tabstop=4 shiftwidth=4 expandtab tw=78: */
+/* vim:set ts=4 sw=4 sts=4 expandtab tw=78: */
