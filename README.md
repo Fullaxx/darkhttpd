@@ -9,15 +9,15 @@ SCRATCH
 
 ## Get the image from Docker Hub
 ```
-docker pull fullaxx/darkhttpd
+docker pull ghcr.io/fullaxx/darkhttpd
 ```
 
 ## Run the image
 ```
-docker run -d -p 80:80 -v /srv/docker/darkhttpd/www:/www fullaxx/darkhttpd /www
+docker run -d -p 80:80 -v /srv/docker/darkhttpd/www:/www ghcr.io/fullaxx/darkhttpd /www
 ```
 
 ## Build it locally using the github repository
 ```
-docker build -t="fullaxx/darkhttpd" github.com/Fullaxx/darkhttpd
+docker build -t="fullaxx/darkhttpd" github.com/fullaxx/darkhttpd
 ```
