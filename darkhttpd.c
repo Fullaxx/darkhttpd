@@ -1,6 +1,6 @@
 /* darkhttpd - a simple, single-threaded, static content webserver.
  * https://unix4lyfe.org/darkhttpd/
- * Copyright (c) 2003-2024 Emil Mikulic <emikulic@gmail.com>
+ * Copyright (c) 2003-2025 Emil Mikulic <emikulic@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the
@@ -18,8 +18,8 @@
  */
 
 static const char
-    pkgname[]   = "darkhttpd/1.16.from.git",
-    copyright[] = "copyright (c) 2003-2024 Emil Mikulic";
+    pkgname[]   = "darkhttpd/1.17.from.git",
+    copyright[] = "copyright (c) 2003-2025 Emil Mikulic";
 
 /* Possible build options: -DDEBUG -DNO_IPV6 */
 
@@ -74,7 +74,7 @@ static const int debug = 1;
 /* The time formatting that we use in directory listings.                    */
 /* An example of the default is 2013-09-09 13:01, which should be compatible */
 /* with xbmc/kodi.                                                           */
-#define DIR_LIST_MTIME_FORMAT "%Y-%m-%d %R"
+#define DIR_LIST_MTIME_FORMAT "%Y-%m-%d %H:%M"
 #define DIR_LIST_MTIME_SIZE 16 + 1 /* How large the buffer will need to be. */
 
 /* This is for non-root chroot support on FreeBSD 14.0+ */
@@ -327,7 +327,8 @@ static char *logfile_name = NULL;   /* NULL = no logging */
 static FILE *logfile = NULL;
 static char *pidfile_name = NULL;   /* NULL = no pidfile */
 static int want_chroot = 0, want_daemon = 0, want_accf = 0,
-           want_keepalive = 1, want_server_id = 1, want_single_file = 0;
+           want_keepalive = 1, want_server_id = 1, want_single_file = 0,
+           want_hide_dotfiles = 0;
 static char *server_hdr = NULL;
 static char *auth_key = NULL;       /* NULL or "Basic base64_of_password" */
 static char *custom_hdrs = NULL;
@@ -344,36 +345,38 @@ static gid_t drop_gid = INVALID_GID;
 
 /* Default mimetype mappings - make sure this array is NULL terminated. */
 static const char *default_extension_map[] = {
-    "application/json"     " json",
-    "application/pdf"      " pdf",
-    "application/wasm"     " wasm",
-    "application/xml"      " xsl xml",
-    "application/xml-dtd"  " dtd",
-    "application/xslt+xml" " xslt",
-    "application/zip"      " zip",
-    "audio/flac"           " flac",
-    "audio/mpeg"           " mp2 mp3 mpga",
-    "audio/ogg"            " ogg opus oga spx",
-    "audio/wav"            " wav",
-    "audio/x-m4a"          " m4a",
-    "font/woff"            " woff",
-    "font/woff2"           " woff2",
-    "image/apng"           " apng",
-    "image/avif"           " avif",
-    "image/gif"            " gif",
-    "image/jpeg"           " jpeg jpe jpg",
-    "image/png"            " png",
-    "image/svg+xml"        " svg",
-    "image/webp"           " webp",
-    "text/css"             " css",
-    "text/html"            " html htm",
-    "text/javascript"      " js",
-    "text/plain"           " txt asc",
-    "video/mpeg"           " mpeg mpe mpg",
-    "video/quicktime"      " qt mov",
-    "video/webm"           " webm",
-    "video/x-msvideo"      " avi",
-    "video/mp4"            " mp4 m4v",
+    "application/json"      " json",
+    "application/pdf"       " pdf",
+    "application/rss+xml"   " rss",
+    "application/wasm"      " wasm",
+    "application/xhtml+xml" " xhtml xht",
+    "application/xml"       " xsl xml",
+    "application/xml-dtd"   " dtd",
+    "application/xslt+xml"  " xslt",
+    "application/zip"       " zip",
+    "audio/flac"            " flac",
+    "audio/mpeg"            " mp2 mp3 mpga",
+    "audio/ogg"             " ogg opus oga spx",
+    "audio/wav"             " wav",
+    "audio/x-m4a"           " m4a",
+    "font/woff"             " woff",
+    "font/woff2"            " woff2",
+    "image/apng"            " apng",
+    "image/avif"            " avif",
+    "image/gif"             " gif",
+    "image/jpeg"            " jpeg jpe jpg",
+    "image/png"             " png",
+    "image/svg+xml"         " svg",
+    "image/webp"            " webp",
+    "text/css"              " css",
+    "text/html"             " html htm",
+    "text/javascript"       " js mjs",
+    "text/plain"            " txt asc",
+    "video/mpeg"            " mpeg mpe mpg",
+    "video/quicktime"       " qt mov",
+    "video/webm"            " webm",
+    "video/x-msvideo"       " avi",
+    "video/mp4"             " mp4 m4v",
     NULL
 };
 
@@ -512,8 +515,6 @@ static char *split_string(const char *src,
         const size_t left, const size_t right) {
     char *dest;
     assert(left <= right);
-    assert(left < strlen(src));   /* [left means must be smaller */
-    assert(right <= strlen(src)); /* right) means can be equal or smaller */
 
     dest = xmalloc(right - left + 1);
     memcpy(dest, src+left, right-left);
@@ -973,6 +974,8 @@ static void usage(const char *argv0) {
     printf("\t--single-file\n"
     "\t\tOnly serve a single file provided as /path/to/file instead\n"
     "\t\tof a whole directory.\n\n");
+    printf("\t--hide-dotfiles\n"
+    "\t\tDon't serve dotfiles.\n\n");
     printf("\t--forward host url (default: don't forward)\n"
     "\t\tWeb forward (301 redirect).\n"
     "\t\tRequests to the host are redirected to the corresponding url.\n"
@@ -1019,7 +1022,7 @@ static char *base64_encode(char *str) {
     int input_length = strlen(str);
     int output_length = 4 * ((input_length + 2) / 3);
 
-    char *encoded_data = malloc(output_length+1);
+    char *encoded_data = xmalloc(output_length+1);
     if (encoded_data == NULL) return NULL;
 
     int i;
@@ -1087,7 +1090,7 @@ static void parse_commandline(const int argc, char *argv[]) {
     if (getuid() == 0)
         bindport = 80;
 
-    custom_hdrs = strdup("");
+    custom_hdrs = xstrdup("");
 
     wwwroot = xstrdup(argv[1]);
     /* Strip ending slash. */
@@ -1185,6 +1188,9 @@ static void parse_commandline(const int argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "--single-file") == 0) {
             want_single_file = 1;
+        }
+        else if (strcmp(argv[i], "--hide-dotfiles") == 0) {
+            want_hide_dotfiles = 1;
         }
         else if (strcmp(argv[i], "--forward") == 0) {
             const char *host, *url;
@@ -1368,9 +1374,8 @@ static void logencode(const char *src, char *dest) {
 #define CLF_DATE_LEN 29 /* strlen("[10/Oct/2000:13:55:36 -0700]")+1 */
 static char *clf_date(char *dest, const time_t when) {
     time_t when_copy = when;
-    struct tm tm;
-    localtime_r(&when_copy, &tm);
-    if (strftime(dest, CLF_DATE_LEN, "[%d/%b/%Y:%H:%M:%S %z]", &tm) == 0) {
+    if (strftime(dest, CLF_DATE_LEN,
+                 "[%d/%b/%Y:%H:%M:%S %z]", localtime(&when_copy)) == 0) {
         dest[0] = 0;
     }
     return dest;
@@ -1561,6 +1566,51 @@ static char *urldecode(const char *url) {
     return out;
 }
 
+/**
+ * normalize_path – Convert an absolute-form HTTP request target into an
+ *                   origin-form path so the server can accept requests
+ *                   conforming to RFC 9112 §3.2.2.
+ *
+ * RFC 9112 §3.2.2 permits clients (especially forward proxies) to send the
+ * request-line in “absolute-form”, e.g.:
+ *
+ *     GET http://example.com/foo/bar?q=1 HTTP/1.1
+ *
+ * Many origin servers expect the traditional “origin-form” instead:
+ *
+ *     GET /foo/bar?q=1 HTTP/1.1
+ *
+ * This helper strips the <scheme> "://" and the authority component
+ * ("host[:port]") from an absolute URI, leaving only the path (plus any query
+ * or fragment).  If no ‘/’ is found after the authority, the function returns
+ * “/” to represent the root path, as required by the specification.
+ *
+ * - The transformation is performed **in-place**; therefore the caller must
+ *   pass a writable buffer.
+ * - The returned pointer is identical to the input pointer and refers to the
+ *   normalised path.
+ *
+ * Example:
+ *   char *buf = strdup("https://example.com:8080/foo/bar?a=1#frag");
+ *   printf("%s\n", normalize_path(buf));  // → "/foo/bar?a=1#frag"
+ */
+static char *normalize_path(char *url) {
+    size_t pos = 0;
+    if (url == NULL) return url;
+    if (strncmp(url, "http://", 7) == 0) {
+        pos += 7;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        pos += 8;
+    }
+    if (pos > 0) {
+        while (url[pos] && url[pos] != '/') {
+            pos++;
+        }
+        memmove(url, url+pos, strlen(url)+1-pos);
+    }
+    return url;
+}
+
 /* Returns Connection or Keep-Alive header, depending on conn_close. */
 static const char *keep_alive(const struct connection *conn)
 {
@@ -1707,6 +1757,7 @@ static void redirect_https(struct connection *conn) {
 
     /* work out path of file being requested */
     url = urldecode(conn->url);
+    url = normalize_path(url);
 
     /* make sure it's safe */
     if (make_safe_url(url) == NULL) {
@@ -1800,7 +1851,6 @@ static void parse_range_field(struct connection *conn) {
 static int parse_request(struct connection *conn) {
     size_t bound1, bound2;
     char *tmp;
-    assert(conn->request_length == strlen(conn->request));
 
     /* parse method */
     for (bound1 = 0;
@@ -1827,9 +1877,12 @@ static int parse_request(struct connection *conn) {
         (conn->request[bound2] != ' ') &&
         (conn->request[bound2] != '\r') &&
         (conn->request[bound2] != '\n');
-        bound2++)
-            ;
-
+        bound2++) {
+        if (conn->request[bound2] == '\0') {
+            /* don't allow ascii nul in URL */
+            return 0;
+        }
+    }
     conn->url = split_string(conn->request, bound1, bound2);
 
     /* parse protocol to determine conn_close */
@@ -1885,10 +1938,10 @@ static int file_exists(const char *path) {
 }
 
 struct dlent {
-    char *name;            /* The name/path of the entry.                 */
-    int is_dir;            /* If the entry is a directory and not a file. */
-    off_t size;            /* The size of the entry, in bytes.            */
-    struct timespec mtime; /* When the file was last modified.            */
+    char *name;   /* The name/path of the entry.                 */
+    int is_dir;   /* If the entry is a directory and not a file. */
+    off_t size;   /* The size of the entry, in bytes.            */
+    time_t mtime; /* When the file was last modified.            */
 };
 
 static int dlent_cmp(const void *a, const void *b) {
@@ -1920,6 +1973,8 @@ static ssize_t make_sorted_dirlist(const char *path, struct dlent ***output) {
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue; /* skip "." and ".." */
+        if (want_hide_dotfiles && ent->d_name[0] == '.')
+            continue;
         assert(strlen(ent->d_name) <= MAXNAMLEN);
         sprintf(currname, "%s%s", path, ent->d_name);
         if (stat(currname, &s) == -1)
@@ -1932,7 +1987,7 @@ static ssize_t make_sorted_dirlist(const char *path, struct dlent ***output) {
         list[entries]->name = xstrdup(ent->d_name);
         list[entries]->is_dir = S_ISDIR(s.st_mode);
         list[entries]->size = s.st_size;
-        list[entries]->mtime = s.st_mtim;
+        list[entries]->mtime = s.st_mtim.tv_sec;
         entries++;
     }
     closedir(dir);
@@ -2020,7 +2075,7 @@ static void generate_dir_listing(struct connection *conn, const char *path,
     char date[DATE_LEN], *spaces;
     struct dlent **list;
     ssize_t listsize;
-    size_t maxlen = 3; /* There has to be ".." */
+    size_t maxlen = 0;
     int i;
     struct apbuf *listing;
 
@@ -2069,6 +2124,7 @@ static void generate_dir_listing(struct connection *conn, const char *path,
          * the url would be three times its original length.
          */
         char safe_url[MAXNAMLEN*3 + 1];
+        char buf[DIR_LIST_MTIME_SIZE];
 
         urlencode(list[i]->name, safe_url);
 
@@ -2080,10 +2136,8 @@ static void generate_dir_listing(struct connection *conn, const char *path,
         append_escaped(listing, list[i]->name);
         append(listing, "</a>");
 
-        char buf[DIR_LIST_MTIME_SIZE];
-        struct tm tm;
-        localtime_r(&list[i]->mtime.tv_sec, &tm);
-        strftime(buf, sizeof buf, DIR_LIST_MTIME_FORMAT, &tm);
+        strftime(buf, DIR_LIST_MTIME_SIZE,
+                 DIR_LIST_MTIME_FORMAT, localtime(&list[i]->mtime));
 
         if (list[i]->is_dir) {
             append(listing, "/");
@@ -2144,6 +2198,7 @@ static void process_get(struct connection *conn) {
 
     /* work out path of file being requested */
     decoded_url = urldecode(conn->url);
+    decoded_url = normalize_path(decoded_url);
 
     /* make sure it's safe */
     if (make_safe_url(decoded_url) == NULL) {
@@ -2176,6 +2231,19 @@ static void process_get(struct connection *conn) {
         redirect(conn, "%s%s", forward_to, decoded_url);
         free(decoded_url);
         return;
+    }
+
+    if (want_hide_dotfiles) {
+        size_t i;
+        for (i = 0; i < strlen(decoded_url) - 1; i++) {
+            if (decoded_url[i] == '/' && decoded_url[i + 1] == '.') {
+                free(decoded_url);
+                /* Don't serve dot files when using --hide-dotfiles */
+                default_reply(conn, 404, "Not Found",
+                    "The URL you requested was not found.");
+                return;
+            }
+        }
     }
 
     if (want_single_file) {
